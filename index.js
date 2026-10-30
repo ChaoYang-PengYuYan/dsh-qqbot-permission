@@ -15,10 +15,11 @@
  *   - 上级会话：子代理的会话头记着 parentSession，顺着往上找，上级是 QQ 会话的也算
  *
  * 另外，QQ 会话的 web_fetch 只许打开公网网址（webFetchPublicOnly）。
+ * 拦截记录（谁、拦了什么、当时说的话）写进 ~/.dsh-qqbot/permission-log.jsonl，重启后还在（persistLog）。
  *
  * 设置页「QQ机器人权限」：识别状态、勾选常用权限、拦截记录；保存写回 profile 的 cordis.patch.yml 并热重载。
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -43,7 +44,13 @@ export const CONFIG_PATH = '/qqbot-permission/config';
 export const WORKSPACE_PATH = '/qqbot-permission/qq-workspace';
 export const OPEN_DIR_PATH = '/qqbot-permission/open-dir';
 const MAX_BODY = 64 * 1024;
-const MAX_LOG = 50;
+export const CLEAR_LOG_PATH = '/qqbot-permission/clear-log';
+const MAX_LOG = 50;                      // 设置页显示的条数
+const MAX_FILE_LINES = 2000;             // 记录文件最多保留的条数（超出 500 条时裁掉最旧的）
+// 拦截记录放在 QQ 插件的数据目录里、专用工作目录之外：QQ 会话的沙箱碰不到
+const LOG_DIR = resolve(homedir(), '.dsh-qqbot');
+const LOG_FILE = join(LOG_DIR, 'permission-log.jsonl');
+const TOTALS_FILE = join(LOG_DIR, 'permission-totals.json');
 
 export const Config = Schema.object({
     enabled: Schema.boolean().default(true).description('总开关：关掉后 QQ 机器人恢复使用全部工具'),
@@ -57,7 +64,21 @@ export const Config = Schema.object({
     denyMessage: Schema.string().default(DEFAULT_DENY).description('拦截时回给 AI 的话（{tool} 会换成工具名）'),
     cwdPrefixes: Schema.array(Schema.string()).default([]).description('额外按工作目录识别 QQ 会话：会话工作目录在这些目录下面就算（QQ 插件自己的 cwd 会自动加上）'),
     webFetchPublicOnly: Schema.boolean().default(true).description('QQ 会话的 web_fetch 只许打开公网网址，本机、内网、局域网主机名一律拦截'),
+    persistLog: Schema.boolean().default(true).description('拦截记录写进 ~/.dsh-qqbot/permission-log.jsonl，DSH 重启后还在'),
 });
+
+/**
+ * 从 QQ 插件写进会话的用户消息里读出是谁说的：群聊消息带「[昵称 (openid)] 正文」前缀，私聊没有。
+ * 引用消息时前面还有一段 [Quoted message begins]……[Current message]，只看当前这条。
+ */
+export function parseQqUserText(text) {
+    if (typeof text !== 'string' || !text)
+        return null;
+    const current = text.includes('[Current message]\n') ? text.slice(text.lastIndexOf('[Current message]\n') + 18) : text;
+    const m = /^\[([^\[\]\n]{1,64}) \(([0-9A-Za-z_-]{6,80})\)\] ?([\s\S]*)$/.exec(current);
+    const clip = (s) => s.replace(/ \(@you\)$/, '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    return m ? { chat: 'group', name: m[1], openid: m[2], text: clip(m[3]) } : { chat: 'c2c', text: clip(current) };
+}
 
 const fill = (template, vars) => template.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
 
@@ -311,12 +332,62 @@ export function apply(ctx, config) {
         rejectedApprovals: 0,
     };
     const seen = new Set();
-    const log = [];                      // 拦截记录（新的在前）
+    const log = [];                      // 拦截记录（新的在前，最多 MAX_LOG 条）
+    // 累计次数：跨重启保留，清空记录时归零
+    const totals = { blocked: 0, rejectedApprovals: 0, since: Date.now() };
+    let fileLines = 0;
+    let warnedWrite = false;
 
-    const record = (kind, tool) => {
-        log.unshift({ time: Date.now(), kind, tool });
+    if (config.persistLog) {
+        try {
+            const lines = existsSync(LOG_FILE) ? readFileSync(LOG_FILE, 'utf8').split('\n').filter(Boolean) : [];
+            fileLines = lines.length;
+            for (const line of lines.slice(-MAX_LOG).reverse()) {
+                try {
+                    log.push(JSON.parse(line));
+                }
+                catch {
+                    // 跳过写坏的行
+                }
+            }
+            if (existsSync(TOTALS_FILE))
+                Object.assign(totals, JSON.parse(readFileSync(TOTALS_FILE, 'utf8')));
+        }
+        catch (err) {
+            logger.warn(`qqbot-permission: 读取拦截记录失败 ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+
+    function persist(entry) {
+        try {
+            mkdirSync(LOG_DIR, { recursive: true });
+            appendFileSync(LOG_FILE, `${JSON.stringify(entry)}\n`, 'utf8');
+            writeFileSync(TOTALS_FILE, JSON.stringify(totals), 'utf8');
+            if (++fileLines > MAX_FILE_LINES + 500) {
+                const kept = readFileSync(LOG_FILE, 'utf8').split('\n').filter(Boolean).slice(-MAX_FILE_LINES);
+                writeFileSync(LOG_FILE, `${kept.join('\n')}\n`, 'utf8');
+                fileLines = kept.length;
+            }
+        }
+        catch (err) {
+            if (!warnedWrite)
+                logger.warn(`qqbot-permission: 写拦截记录失败 ${err instanceof Error ? err.message : String(err)}`);
+            warnedWrite = true;
+        }
+    }
+
+    /** 记一条拦截：谁（群聊昵称 / 私聊）、在哪个会话、当时说了什么 */
+    function record(kind, tool, agent) {
+        if (kind === 'approval')
+            totals.rejectedApprovals++;
+        else
+            totals.blocked++;
+        const entry = { time: Date.now(), kind, tool, ...whoOf(agent) };
+        log.unshift(entry);
         log.length = Math.min(log.length, MAX_LOG);
-    };
+        if (config.persistLog)
+            persist(entry);
+    }
 
     const remember = (agent) => {
         if (!agent || typeof agent !== 'object')
@@ -348,6 +419,38 @@ export function apply(ctx, config) {
             parentId = parent.session?.header?.parentSession;
         }
         return false;
+    }
+
+    /** 会话里最近一条 QQ 用户发来的消息正文（往回最多看 400 条事件；DSH 改了会话接口就返回 ''） */
+    function lastUserText(agent) {
+        try {
+            const session = agent?.session;
+            for (let seq = Number(session.seq) - 1, n = 0; seq >= 0 && n < 400; seq--, n++) {
+                const event = session.eventAt(seq);
+                if (event?.type === 'user/message' && event.data?.source?.kind === 'user')
+                    return (event.data.content ?? []).filter((p) => p?.type === 'text').map((p) => p.text).join('\n');
+            }
+        }
+        catch {
+            // 读不到就不记原话
+        }
+        return '';
+    }
+
+    /** 拦截记录里的「谁」：子代理往上找到最顶上的 QQ 会话，读它最近一条用户消息 */
+    function whoOf(agent) {
+        const agents = ctx.get?.('agents');
+        let root = agent;
+        for (let depth = 0; depth < 32; depth++) {
+            const parentId = root?.session?.header?.parentSession;
+            const parent = typeof parentId === 'string' ? agents?.get?.(parentId) : undefined;
+            if (!parent || !isQq(parent))
+                break;
+            root = parent;
+        }
+        const id = root?.session?.header?.id ?? root?.id;
+        const who = parseQqUserText(lastUserText(root)) ?? {};
+        return { ...(typeof id === 'string' ? { session: id } : {}), ...who };
     }
 
     /** 返回识别依据（'prompt' / 'cwd' / 'parent'），不是 QQ 会话返回 '' */
@@ -383,7 +486,7 @@ export function apply(ctx, config) {
                 return undefined;
             if (!allow.has(exec.name)) {
                 stats.blocked++;
-                record('call', exec.name);
+                record('call', exec.name, exec.agent);
                 logger.info(`qqbot-permission: 已拦截 QQ 会话调用 ${exec.name}`);
                 return fill(config.denyMessage || DEFAULT_DENY, { tool: exec.name });
             }
@@ -392,7 +495,7 @@ export function apply(ctx, config) {
                 const reason = nonPublicUrl(url);
                 if (reason) {
                     stats.blocked++;
-                    record('fetch', url.slice(0, 200));
+                    record('fetch', url.slice(0, 200), exec.agent);
                     logger.info(`qqbot-permission: 已拦截 QQ 会话打开 ${url.slice(0, 200)}（${reason}）`);
                     return `QQ 里的 web_fetch 只能打开公网网址，这个网址不行（${reason}）。不要换写法重试，直接告诉对方这个打不开。`;
                 }
@@ -449,7 +552,7 @@ export function apply(ctx, config) {
         try {
             if (config.enabled && config.rejectApprovals && request?.agent && isQq(request.agent)) {
                 stats.rejectedApprovals++;
-                record('approval', request.tool ?? request.toolName ?? '');
+                record('approval', request.tool ?? request.toolName ?? '', request.agent);
                 logger.info('qqbot-permission: 已拒绝 QQ 会话的越权审批请求');
                 return 'rejected';
             }
@@ -577,6 +680,9 @@ export function apply(ctx, config) {
             qqbot: qqbotHealth(),
             qqWorkspace: QQ_WORKSPACE,
             stats,
+            totals,
+            logFile: config.persistLog ? LOG_FILE : null,
+            logDir: LOG_DIR,
             log,
             registered: registered ? [...registered.keys()].sort() : null,
             catalog: buildCatalog(registered),
@@ -670,8 +776,8 @@ export function apply(ctx, config) {
         catch (err) {
             return sendJson(res, 400, { ok: false, error: `请求格式不对：${err instanceof Error ? err.message : String(err)}` });
         }
-        if (typeof dir !== 'string' || !cwdPrefixes.includes(normalizePath(dir)))
-            return sendJson(res, 400, { ok: false, error: '只能打开识别 QQ 会话用的工作目录' });
+        if (typeof dir !== 'string' || ![...cwdPrefixes, normalizePath(LOG_DIR)].includes(normalizePath(dir)))
+            return sendJson(res, 400, { ok: false, error: '只能打开识别 QQ 会话用的工作目录或拦截记录所在目录' });
         const target = resolve(dir);
         if (!existsSync(target) || !statSync(target).isDirectory())
             return sendJson(res, 404, { ok: false, error: `目录不存在：${target}` });
@@ -686,6 +792,30 @@ export function apply(ctx, config) {
             return sendJson(res, 500, { ok: false, error: `打开失败：${err instanceof Error ? err.message : String(err)}` });
         }
         return sendJson(res, 200, { ok: true, message: `已打开 ${target}` });
+    }
+
+    /** 清空拦截记录：内存里的、记录文件、累计次数一起清 */
+    async function handleClearLog(req, res) {
+        if (!sameOrigin(req))
+            return sendJson(res, 403, { error: 'forbidden' });
+        if (req.method !== 'POST')
+            return sendJson(res, 405, { error: 'method not allowed' });
+        log.length = 0;
+        Object.assign(totals, { blocked: 0, rejectedApprovals: 0, since: Date.now() });
+        stats.blocked = 0;
+        stats.rejectedApprovals = 0;
+        try {
+            if (existsSync(LOG_FILE))
+                writeFileSync(LOG_FILE, '', 'utf8');
+            if (existsSync(TOTALS_FILE))
+                writeFileSync(TOTALS_FILE, JSON.stringify(totals), 'utf8');
+            fileLines = 0;
+        }
+        catch (err) {
+            return sendJson(res, 500, { ok: false, error: `清空失败：${err instanceof Error ? err.message : String(err)}` });
+        }
+        logger.info('qqbot-permission: 已清空拦截记录');
+        return sendJson(res, 200, { ok: true, message: '已清空拦截记录' });
     }
 
     const routeHandler = (handle) => (req, res) => {
@@ -706,6 +836,7 @@ export function apply(ctx, config) {
             webServer.register({ kind: 'exact', path: CONFIG_PATH, handler: routeHandler(handleConfig) }),
             webServer.register({ kind: 'exact', path: WORKSPACE_PATH, handler: routeHandler(handleWorkspace) }),
             webServer.register({ kind: 'exact', path: OPEN_DIR_PATH, handler: routeHandler(handleOpenDir) }),
+            webServer.register({ kind: 'exact', path: CLEAR_LOG_PATH, handler: routeHandler(handleClearLog) }),
         ];
         scoped.effect?.(() => () => { for (const d of disposers) d?.(); }, 'qqbot-permission.panel-routes');
     });

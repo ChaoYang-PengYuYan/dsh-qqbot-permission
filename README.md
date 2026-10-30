@@ -106,6 +106,17 @@ dsh plugin --profile <profile 名> add github:ChaoYang-PengYuYan/dsh-qqbot-permi
 
 都不满足时，QQ 会话会被当成普通会话放行。设置页「怎么认出 QQ 会话」会逐项标出 ✓ / ✗，升级 DSH 或 QQ 插件后请看一眼。
 
+## 拦截记录
+
+每次拦截都会记下：时间、**谁**、拦了什么（工具名或网址）、对方当时说的话。
+
+- **群聊**：QQ 插件会在消息前加上发送者的 QQ 昵称和 openid，所以能看到是哪个群友在试；鼠标停在名字上可以看 openid
+- **私聊**：一个私聊会话就是一个人，记录里带会话 id
+
+记录写进 `~/.dsh-qqbot/permission-log.jsonl`（每行一条 JSON，最多保留 2000 条），累计次数在 `permission-totals.json`，DSH 重启后都还在。设置页显示最近 50 条，可以「打开目录」看完整文件，也可以「清空记录」（要点两次）。不想留文件就关掉「拦截记录写进文件」。
+
+记录里有群友的昵称和聊天内容，只存在这台电脑上。只要没放行读文件、执行命令这类工具，QQ 机器人就读不到它。
+
 ## 配置
 
 都可以在设置页改；保存后写入 profile 的 `cordis.patch.yml`，插件自动重新加载。手动写的话：
@@ -121,6 +132,7 @@ dsh plugin --profile <profile 名> add github:ChaoYang-PengYuYan/dsh-qqbot-permi
     hideTools: true                # 白名单以外的工具不发给模型
     rejectApprovals: true          # 拒绝 QQ 会话的越权审批
     webFetchPublicOnly: true       # QQ 会话的 web_fetch 只许打开公网网址
+    persistLog: true               # 拦截记录写进 ~/.dsh-qqbot/permission-log.jsonl
     notice:
       enabled: true                # 告诉 AI 它能用哪些工具
       text: '……{tools}……'

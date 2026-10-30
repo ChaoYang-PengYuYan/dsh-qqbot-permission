@@ -1,6 +1,6 @@
 {
   "name": "dsh-qqbot-permission",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "icon": "./assets/icon.svg",
   "description": "QQ机器人权限：QQ 机器人只能用白名单里的工具（读文件、执行命令等一律拦截），设置页里勾选常用权限即可配置。",
   "type": "module",

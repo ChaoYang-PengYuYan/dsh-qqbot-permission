@@ -1,0 +1,63 @@
+{
+  "name": "dsh-qqbot-permission",
+  "version": "1.1.0",
+  "icon": "./assets/icon.svg",
+  "description": "QQ机器人权限：QQ 机器人只能用白名单里的工具（读文件、执行命令等一律拦截），设置页里勾选常用权限即可配置。",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/catalog.js",
+    "lib/client.js",
+    "assets/icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "qqbot",
+    "permission",
+    "guard"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ChaoYang-PengYuYan/dsh-qqbot-permission.git"
+  },
+  "homepage": "https://github.com/ChaoYang-PengYuYan/dsh-qqbot-permission#readme",
+  "bugs": {
+    "url": "https://github.com/ChaoYang-PengYuYan/dsh-qqbot-permission/issues"
+  },
+  "engines": {
+    "node": ">=20.3.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    },
+    "compatibility": {
+      "note": "按 DeepSeek Harness 0.2.1-rc.3 + @tencent-connect/dsh-qqbot 0.5.3 编写。识别 QQ 会话依赖 qqbot 的 qqbot:scope-prompt 提示词段落或 QQ 插件的专用工作目录；升级后请在设置页「QQ机器人权限」确认识别状态。"
+    }
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.1",
+    "@deepseek-ai/schemastery": ">=3.18.1"
+  }
+}

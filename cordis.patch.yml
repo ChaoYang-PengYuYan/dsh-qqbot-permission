@@ -1,0 +1,7 @@
+# dsh-qqbot-permission bundle patch：安装后 dsh 启动时自动加载
+# 所有配置都可以在 设置 →「QQ机器人权限」里勾选和修改（保存后写入 profile 的 cordis.patch.yml）
+- insert:
+    - id: qqbot-permission
+      name: 'dsh-qqbot-permission'
+      config:
+        enabled: true

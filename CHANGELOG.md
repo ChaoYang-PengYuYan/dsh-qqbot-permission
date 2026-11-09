@@ -1,5 +1,11 @@
 # 更新记录
 
+## 1.3.0 - 2026-11-09
+
+- QQ 机器人命令（`/model`、`/new`、`/preset`……）默认只有管理员能用：其他人发的命令开头换成全角「／」，QQ 插件不当命令执行，消息交给 AI，AI 回复「只有管理员能用」；新选项 `commandPolicy`（`admins` / `everyone`）和 `commandAdmins`（管理员的 QQ openid）
+- 设置页新增「QQ 机器人命令」卡片：是否生效、最近发过消息的人，一键设为 / 取消管理员
+- 被拦下的命令记进拦截记录（类型「机器人命令」），单独统计累计次数
+
 ## 1.2.0 - 2026-10-30
 
 - 拦截记录写进 `~/.dsh-qqbot/permission-log.jsonl`（最多 2000 条），累计次数写进 `permission-totals.json`，DSH 重启后都还在；新选项 `persistLog`（默认开）

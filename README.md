@@ -12,6 +12,7 @@ QQ 机器人默认和你在桌面版里用的 AI 拥有**同样的工具**：执
 |---|---|---|
 | 执行时拦截 | `ctx.tools.guard` | QQ 会话调用白名单以外的工具直接拒绝。这是硬边界：模型就算自己编出工具名去调也会被挡住 |
 | 请求里隐藏 | `system-prompt/assemble` | 白名单以外的工具不发给模型（看不到就不会去试，也省 token），并追加一段说明告诉它在 QQ 里能做什么 |
+| 管住机器人命令 | 包一层 `QQBot.handleInboundMessage` | `/model`、`/new` 这类 QQ 插件命令默认只有管理员能用，其他人发的当成普通聊天 |
 | 拒绝越权审批 | `approval/request` | QQ 插件会把「✅ 允许一次 / ❌ 拒绝」按钮发到群里，**群里任何人都能点**；本插件直接拒绝 QQ 会话的审批请求 |
 | `web_fetch` 只许公网 | `ctx.tools.guard` 检查网址 | 放行了「读取网页」时，`localhost`、`127.0.0.1`、`192.168.x.x`、局域网主机名等一律拦截，群友没法借机器人探本机和内网 |
 
@@ -106,6 +107,30 @@ dsh plugin --profile <profile 名> add github:ChaoYang-PengYuYan/dsh-qqbot-permi
 
 都不满足时，QQ 会话会被当成普通会话放行。设置页「怎么认出 QQ 会话」会逐项标出 ✓ / ✗，升级 DSH 或 QQ 插件后请看一眼。
 
+## QQ 机器人命令
+
+QQ 插件自带一套命令，由 QQ 插件直接执行，不经过 AI，**默认谁发都能用**：群友可以随手把你的模型换掉、把会话清空。
+
+| 命令 | 作用 |
+|---|---|
+| `/model [provider/model]` | 查看或切换模型 |
+| `/preset [id]` | 查看或切换 agent 预设 |
+| `/new`（`/reset`、`/clear`） | 开始新会话，清空上下文 |
+| `/compact` | 压缩会话历史 |
+| `/stop` | 中止当前生成 |
+| `/bot-status`、`/bot-ping`、`/bot-version`、`/bot-help` | 会话状态、网络延迟、版本、命令列表 |
+
+本插件只管这些命令（启动时从 QQ 插件源码里读出命令名），`/画图` 之类别的斜杠开头的话照原样交给 AI。
+
+本插件默认改成**只有管理员能用**：
+
+- 非管理员发的命令，开头的 `/` 会换成全角 `／`，QQ 插件就不当命令执行，消息照常交给 AI；AI 收到的权限说明里写着「以／开头的是被拦下的命令」，会回复对方这个命令只有管理员能用
+- 管理员按 QQ openid 设置。用自己的 QQ 给机器人发句话，在设置页「QQ 机器人命令」卡片的「最近发过消息的人」里点「设为管理员」即可
+- 被拦下的命令记在拦截记录里，类型是「机器人命令」
+- 想恢复 QQ 插件原来的行为，把「谁能用 QQ 机器人命令」改成「所有人」
+
+> 实现方式：QQ 插件没有给命令加权限的设置，消息也到不了 DSH，所以本插件包了一层 QQ 机器人 SDK（`@tencent-connect/qqbot-nodejs`）的 `QQBot.handleInboundMessage`，在 QQ 插件处理每条消息之前改写命令开头。插件停用时还原。设置页会显示它是否生效、经过了多少条消息；QQ 插件或 SDK 大改版后如果显示「没生效」，请反馈。
+
 ## 拦截记录
 
 每次拦截都会记下：时间、**谁**、拦了什么（工具名或网址）、对方当时说的话。
@@ -131,6 +156,8 @@ dsh plugin --profile <profile 名> add github:ChaoYang-PengYuYan/dsh-qqbot-permi
       - web_search
     hideTools: true                # 白名单以外的工具不发给模型
     rejectApprovals: true          # 拒绝 QQ 会话的越权审批
+    commandPolicy: admins          # QQ 机器人命令：admins = 只有管理员，everyone = 所有人
+    commandAdmins: []              # 管理员的 QQ openid
     webFetchPublicOnly: true       # QQ 会话的 web_fetch 只许打开公网网址
     persistLog: true               # 拦截记录写进 ~/.dsh-qqbot/permission-log.jsonl
     notice:

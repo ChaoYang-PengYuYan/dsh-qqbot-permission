@@ -16,6 +16,7 @@
  *
  * 另外，QQ 会话的 web_fetch 只许打开公网网址（webFetchPublicOnly）。
  * 拦截记录（谁、拦了什么、当时说的话）写进 ~/.dsh-qqbot/permission-log.jsonl，重启后还在（persistLog）。
+ * QQ 机器人命令（/model、/new……）默认只有管理员能用，其他人发的当成普通聊天交给 AI（commandPolicy / commandAdmins）。
  *
  * 设置页「QQ机器人权限」：识别状态、勾选常用权限、拦截记录；保存写回 profile 的 cordis.patch.yml 并热重载。
  */
@@ -65,7 +66,39 @@ export const Config = Schema.object({
     cwdPrefixes: Schema.array(Schema.string()).default([]).description('额外按工作目录识别 QQ 会话：会话工作目录在这些目录下面就算（QQ 插件自己的 cwd 会自动加上）'),
     webFetchPublicOnly: Schema.boolean().default(true).description('QQ 会话的 web_fetch 只许打开公网网址，本机、内网、局域网主机名一律拦截'),
     persistLog: Schema.boolean().default(true).description('拦截记录写进 ~/.dsh-qqbot/permission-log.jsonl，DSH 重启后还在'),
+    commandPolicy: Schema.union(['admins', 'everyone']).default('admins')
+        .description('谁能用 QQ 机器人命令（/model、/new、/preset……）：admins = 只有管理员，其他人发的命令当成普通聊天；everyone = 所有人（QQ 插件原本的行为）'),
+    commandAdmins: Schema.array(Schema.string()).default([]).description('能用 QQ 机器人命令的人（QQ openid）'),
 });
+
+const COMMAND_NOTICE = '以「／」开头的消息是对方想用 QQ 机器人命令（比如 ／model、／new），但对方不是管理员，命令没有执行。直接告诉对方这个命令只有管理员能用，不要假装已经执行。';
+// QQ 插件的斜杠命令开头：可能先有 <@机器人> 标记和空白；第 2 组是命令名
+const COMMAND_HEAD = /^((?:\s*<@!?[^>]+>)*\s*)\/(\S+)/;
+// 读不到 QQ 插件源码时用的命令名（@tencent-connect/dsh-qqbot 0.5.3）
+const KNOWN_QQ_COMMANDS = ['new', 'reset', 'clear', 'compact', 'model', 'preset', 'stop', 'bot-help', 'bot-ping', 'bot-version', 'bot-status'];
+const INBOUND_PATCH = Symbol.for('dsh-qqbot-permission.inbound');
+const MAX_SENDERS = 20;
+
+/**
+ * QQ 插件注册的命令名：读它 dist/commands 里的 `name: 'x'` / `name: ['x', 'y']`，再并上内置名单。
+ * 只改写这些命令，「/画图」之类别的斜杠开头的话照原样交给 AI。
+ */
+function qqCommandNames() {
+    const names = new Set(KNOWN_QQ_COMMANDS);
+    try {
+        const dir = join(findProfileDir(), 'node_modules', '@tencent-connect', 'dsh-qqbot', 'dist', 'commands');
+        for (const file of readdirSync(dir).filter((f) => f.endsWith('.js'))) {
+            const text = readFileSync(join(dir, file), 'utf8');
+            for (const [, value] of text.matchAll(/\bname:\s*(\[[^\]]*\]|'[^']*'|"[^"]*")/g))
+                for (const [, n] of value.matchAll(/['"]([\w-]{1,40})['"]/g))
+                    names.add(n.toLowerCase());
+        }
+    }
+    catch {
+        // 读不到就只用内置名单
+    }
+    return names;
+}
 
 /**
  * 从 QQ 插件写进会话的用户消息里读出是谁说的：群聊消息带「[昵称 (openid)] 正文」前缀，私聊没有。
@@ -334,7 +367,7 @@ export function apply(ctx, config) {
     const seen = new Set();
     const log = [];                      // 拦截记录（新的在前，最多 MAX_LOG 条）
     // 累计次数：跨重启保留，清空记录时归零
-    const totals = { blocked: 0, rejectedApprovals: 0, since: Date.now() };
+    const totals = { blocked: 0, rejectedApprovals: 0, commands: 0, since: Date.now() };
     let fileLines = 0;
     let warnedWrite = false;
 
@@ -377,12 +410,14 @@ export function apply(ctx, config) {
     }
 
     /** 记一条拦截：谁（群聊昵称 / 私聊）、在哪个会话、当时说了什么 */
-    function record(kind, tool, agent) {
+    function record(kind, tool, agent, who) {
         if (kind === 'approval')
             totals.rejectedApprovals++;
+        else if (kind === 'command')
+            totals.commands = (totals.commands ?? 0) + 1;
         else
             totals.blocked++;
-        const entry = { time: Date.now(), kind, tool, ...whoOf(agent) };
+        const entry = { time: Date.now(), kind, tool, ...(who ?? whoOf(agent)) };
         log.unshift(entry);
         log.length = Math.min(log.length, MAX_LOG);
         if (config.persistLog)
@@ -474,10 +509,78 @@ export function apply(ctx, config) {
 
     const noticeText = () => {
         const names = [...allow];
-        if (!names.length)
-            return DEFAULT_NOTICE_NONE;
-        return fill(config.notice.text || DEFAULT_NOTICE, { tools: names.join('、') });
+        const base = names.length ? fill(config.notice.text || DEFAULT_NOTICE, { tools: names.join('、') }) : DEFAULT_NOTICE_NONE;
+        return config.commandPolicy === 'admins' ? `${base}\n${COMMAND_NOTICE}` : base;
     };
+
+    // 0. QQ 机器人命令：QQ 插件的斜杠命令在它自己的消息管道里处理，到不了 DSH。
+    //    包一层 QQBot.prototype.handleInboundMessage，非管理员发的「/命令」把开头换成全角「／」，
+    //    QQ 插件就不当命令处理，消息照常交给 AI，AI 按权限说明回复「只有管理员能用」
+    const commandGuard = { active: false, error: '', seen: 0, rewritten: 0 };
+    const senders = new Map();           // 最近发过消息的人（openid → 信息），设置页里用来设管理员
+    const admins = new Set(config.commandAdmins);
+    const commandNames = qqCommandNames();
+
+    function onInbound(raw) {
+        commandGuard.seen++;
+        const openid = typeof raw?.senderId === 'string' ? raw.senderId : '';
+        const chat = raw?.kind === 'group' ? 'group' : 'c2c';
+        const mentioned = chat === 'c2c' || raw?.rawEventType === 'GROUP_AT_MESSAGE_CREATE' || Boolean(raw?.mentions?.some?.((m) => m?.is_you));
+        if (openid && mentioned) {
+            senders.delete(openid);
+            senders.set(openid, { openid, name: raw.senderName ?? '', chat, time: Date.now() });
+            while (senders.size > MAX_SENDERS)
+                senders.delete(senders.keys().next().value);
+        }
+        const content = raw?.content;
+        const head = typeof content === 'string' ? COMMAND_HEAD.exec(content) : null;
+        if (!config.enabled || config.commandPolicy === 'everyone' || !head || !commandNames.has(head[2].toLowerCase()) || admins.has(openid))
+            return raw;
+        commandGuard.rewritten++;
+        if (mentioned) {
+            const text = content.replace(/<@!?[^>]+>/g, '').trim();
+            record('command', text.split(/\s+/)[0], undefined, { chat, ...(chat === 'group' ? { name: raw.senderName ?? '' } : {}), openid, text: text.slice(0, 120) });
+            logger.info(`qqbot-permission: 已拦下 QQ 机器人命令 ${text.slice(0, 40)}（发送者不是管理员）`);
+        }
+        return { ...raw, content: content.replace(COMMAND_HEAD, '$1／$2') };
+    }
+
+    void (async () => {
+        let proto;
+        try {
+            proto = (await import('@tencent-connect/qqbot-nodejs')).QQBot?.prototype;
+        }
+        catch (err) {
+            commandGuard.error = `找不到 QQ 机器人的 SDK（@tencent-connect/qqbot-nodejs）：${err instanceof Error ? err.message : String(err)}`;
+            return;
+        }
+        if (typeof proto?.handleInboundMessage !== 'function') {
+            commandGuard.error = 'QQ 机器人的 SDK 版本不认识（没有 QQBot.handleInboundMessage）';
+            return;
+        }
+        // 上一次加载没来得及还原时，从它记下的原始方法接着包，不叠两层
+        const original = proto[INBOUND_PATCH]?.original ?? proto.handleInboundMessage;
+        const wrapped = function handleInboundMessage(raw) {
+            let next = raw;
+            try {
+                next = onInbound(raw);
+            }
+            catch {
+                // 出错就原样交给 QQ 插件
+            }
+            return original.call(this, next);
+        };
+        proto.handleInboundMessage = wrapped;
+        proto[INBOUND_PATCH] = { original };
+        commandGuard.active = true;
+        ctx.on?.('dispose', () => {
+            if (proto.handleInboundMessage === wrapped) {
+                proto.handleInboundMessage = original;
+                delete proto[INBOUND_PATCH];
+            }
+            commandGuard.active = false;
+        });
+    })();
 
     // 1. 执行时拦截：硬边界
     if (typeof tools?.guard === 'function') {
@@ -683,6 +786,11 @@ export function apply(ctx, config) {
             totals,
             logFile: config.persistLog ? LOG_FILE : null,
             logDir: LOG_DIR,
+            commandGuard,
+            commandPolicy: config.commandPolicy,
+            commandNames: [...commandNames].sort(),
+            commandAdmins: [...admins],
+            senders: [...senders.values()].reverse().map((s) => ({ ...s, admin: admins.has(s.openid) })),
             log,
             registered: registered ? [...registered.keys()].sort() : null,
             catalog: buildCatalog(registered),
@@ -719,6 +827,14 @@ export function apply(ctx, config) {
             const bad = clean.allow.find((n) => !/^[\w.-]{1,80}$/.test(n));
             if (bad)
                 return sendJson(res, 400, { ok: false, error: `工具名格式不对：${bad}` });
+        }
+        if (clean.commandAdmins !== undefined) {
+            if (!Array.isArray(clean.commandAdmins))
+                return sendJson(res, 400, { ok: false, error: '管理员必须是 openid 列表' });
+            clean.commandAdmins = [...new Set(clean.commandAdmins.map((n) => String(n).trim()).filter(Boolean))];
+            const bad = clean.commandAdmins.find((n) => !/^[0-9A-Za-z_-]{6,80}$/.test(n));
+            if (bad)
+                return sendJson(res, 400, { ok: false, error: `openid 格式不对：${bad}` });
         }
         if (clean.cwdPrefixes !== undefined) {
             clean.cwdPrefixes = (clean.cwdPrefixes ?? []).map((p) => String(p).trim()).filter(Boolean);
@@ -801,7 +917,7 @@ export function apply(ctx, config) {
         if (req.method !== 'POST')
             return sendJson(res, 405, { error: 'method not allowed' });
         log.length = 0;
-        Object.assign(totals, { blocked: 0, rejectedApprovals: 0, since: Date.now() });
+        Object.assign(totals, { blocked: 0, rejectedApprovals: 0, commands: 0, since: Date.now() });
         stats.blocked = 0;
         stats.rejectedApprovals = 0;
         try {
